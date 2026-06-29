@@ -1,0 +1,27 @@
+# BUILD.jobs — build the JOBS fetcher-pypi artifact fully offline & CGO-free.
+# Deps (if any) are vendored, so the build needs only the Go toolchain (fetched
+# by the seeded tarball+https) and the seeded shell.
+
+def build():
+    goarch = {"linux/amd64": "amd64", "linux/arm64": "arm64"}[platform]
+    go_sha = {
+        "amd64": "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+        "arm64": "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768",
+    }
+    toolchain = imp(fetcher = "tarball+https", params = {
+        "url": "https://go.dev/dl/go1.26.4.linux-" + goarch + ".tar.gz",
+        "sha256": go_sha[goarch],
+    })
+    script = """
+export GOROOT=/build/goroot
+mkdir -p "$GOROOT" "$out"
+cp -dr "$(jq -r .toolchain <<<"$JOBS_DEPS")/go/." "$GOROOT/"
+export PATH="$GOROOT/bin:$PATH"
+export GOCACHE=/build/gocache GOTOOLCHAIN=local CGO_ENABLED=0 GOPROXY=off GOSUMDB=off
+export GOFLAGS="-mod=$([ -d "$SRC/vendor" ] && echo vendor || echo mod)"
+chmod -R u+w "$GOROOT" 2>/dev/null || true
+cd "$SRC"
+go build -o "$out/fetch" .
+chmod +x "$out/fetch"
+"""
+    return struct(inputs = {"toolchain": toolchain}, env = {}, script = script, runtime_deps = [])
