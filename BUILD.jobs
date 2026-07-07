@@ -24,4 +24,4 @@ cd "$SRC"
 go build -o "$out/fetch" .
 chmod +x "$out/fetch"
 """
-    return struct(inputs = {"toolchain": toolchain}, env = {}, script = script, runtime_deps = [])
+    return struct(name = "tarballxz fetcher", inputs = {"toolchain": toolchain}, env = {}, script = script, runtime_deps = [])
