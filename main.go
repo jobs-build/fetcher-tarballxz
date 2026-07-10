@@ -10,7 +10,7 @@ package main
 
 import (
 	"archive/tar"
-	"bytes"
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -57,7 +57,18 @@ func run(getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "params: url and sha256 are required")
 		return exitHard
 	}
-	data, retryable, err := download(p.URL)
+	// Stream the download to a temp file (hashing inline) instead of buffering
+	// it in memory — rust toolchain tarballs run to hundreds of MB, and the
+	// import may run under a cgroup memory cap. outDir is the one dir the
+	// fetcher contract guarantees writable; the temp file is removed before exit.
+	tmp, err := os.CreateTemp(outDir, ".fetch-*.tmp")
+	if err != nil {
+		fmt.Fprintf(stderr, "temp file: %v\n", err)
+		return exitHard
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	got, retryable, err := download(p.URL, tmp)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		if retryable {
@@ -65,41 +76,46 @@ func run(getenv func(string) string, stderr io.Writer) int {
 		}
 		return exitHard
 	}
-	if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != p.Sha256 {
-		fmt.Fprintf(stderr, "sha256 mismatch for %s: got %s want %s\n", p.URL, hex.EncodeToString(sum[:]), p.Sha256)
+	if got != p.Sha256 {
+		fmt.Fprintf(stderr, "sha256 mismatch for %s: got %s want %s\n", p.URL, got, p.Sha256)
 		return exitHard
 	}
-	if err := extractTarXz(data, outDir, p.Strip); err != nil {
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		fmt.Fprintf(stderr, "seek: %v\n", err)
+		return exitHard
+	}
+	if err := extractTarXz(bufio.NewReader(tmp), outDir, p.Strip); err != nil {
 		fmt.Fprintln(stderr, err)
 		return exitHard
 	}
 	return exitOK
 }
 
-// download fetches the tarball. The bool reports whether a failure is retryable.
-func download(url string) ([]byte, bool, error) {
+// download streams the tarball into w, returning the hex sha256 of the bytes.
+// The bool reports whether a failure is retryable.
+func download(url string, w io.Writer) (string, bool, error) {
 	client := &http.Client{Timeout: 300 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, true, fmt.Errorf("GET %s: %w", url, err)
+		return "", true, fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		return nil, retryable, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+		return "", retryable, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, fmt.Errorf("read body: %w", err)
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(w, h), resp.Body); err != nil {
+		return "", true, fmt.Errorf("read body: %w", err)
 	}
-	return data, false, nil
+	return hex.EncodeToString(h.Sum(nil)), false, nil
 }
 
-// extractTarXz xz-decompresses data and untars it into outDir, dropping the first
+// extractTarXz xz-decompresses r and untars it into outDir, dropping the first
 // `strip` leading path components from each entry. Paths escaping outDir are an
 // error; file modes are preserved; writes use O_NOFOLLOW.
-func extractTarXz(data []byte, outDir string, strip int) error {
-	xr, err := xz.NewReader(bytes.NewReader(data))
+func extractTarXz(r io.Reader, outDir string, strip int) error {
+	xr, err := xz.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("xz: %w", err)
 	}
